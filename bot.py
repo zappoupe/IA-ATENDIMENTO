@@ -217,45 +217,122 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
     """
     Retorna (tem_acesso: bool, config: dict, user_id: str | None)
 
-    Fluxo:
-      1. admin_users  — verifica se o número tem acesso (vitalício ou teste válido)
-      2. assinaturas  — é o dono da conta? pega config de configuracoes_usuario
-      3. membros_familia — é um membro convidado? pega config da própria linha do membro
+    3 portas de entrada INDEPENDENTES — basta estar em UMA delas:
+
+    PORTA 1 — admin_users (celular)
+        Pessoas adicionadas manualmente (teste ou vitalício).
+        Verifica ativo=true + prazo de teste se aplicável.
+
+    PORTA 2 — assinaturas (telefone)
+        Quem pagou de verdade. Verifica ativo=true.
+        Config vem de configuracoes_usuario pelo id.
+
+    PORTA 3 — membros_familia (telefone)
+        Convidados da família. Só libera se o DONO (dono_id)
+        tiver assinatura ativa em assinaturas.
+        Config vem da própria linha do membro.
     """
     if not SUPABASE_URL:
         return None, None, None
 
     tel_limpo = extrair_essencia_telefone(telefone_zapi)
+    sufixo    = tel_limpo[-8:]
 
     async with httpx.AsyncClient() as client:
-        # ── PASSO 1: admin_users ──────────────────────────────────
-        liberado, motivo = await verificar_admin_user(client, tel_limpo)
-        if not liberado:
-            print(f"🚫 [ADMIN] Bloqueado {tel_limpo} — {motivo}")
-            return False, {"_acesso_motivo": motivo}, None
 
-        # ── PASSO 2: é dono? (tabela assinaturas) ────────────────
-        mapa_assinaturas = await buscar_todos_telefones_tabela(client, "assinaturas", "id")
-        if tel_limpo in mapa_assinaturas:
-            user_id = mapa_assinaturas[tel_limpo]
-            config  = await buscar_config_usuario(client, user_id)
-            if not config:
-                config = {}
-            config["_acesso_motivo"] = motivo
+        # ══════════════════════════════════════════
+        # PORTA 1 — admin_users (controle manual)
+        # ══════════════════════════════════════════
+        rows_admin = await sb_get(client, "admin_users",
+            f"celular=like.%25{sufixo}%25&select=*")
+        if rows_admin:
+            adm = rows_admin[0]
+            if adm.get("ativo"):
+                liberado, motivo = await verificar_admin_user(client, tel_limpo)
+                if liberado:
+                    # Tenta pegar config real pelo email
+                    email_adm = adm.get("email", "")
+                    user_id   = None
+                    config    = {}
+                    if email_adm:
+                        ass_rows = await sb_get(client, "assinaturas",
+                            f"email=eq.{email_adm}&select=id,ativo")
+                        if ass_rows:
+                            user_id = ass_rows[0].get("id")
+                            config  = await buscar_config_usuario(client, user_id) if user_id else {}
+                    config["_acesso_motivo"] = motivo
+                    config["_is_membro"]     = False
+                    print(f"🔑 [PORTA 1 — ADMIN] {tel_limpo} | {adm.get('nome','?')} | motivo={motivo}")
+                    return True, config, user_id
+                else:
+                    print(f"🚫 [PORTA 1 — ADMIN] {tel_limpo} bloqueado — {motivo}")
+                    return False, {"_acesso_motivo": motivo}, None
+
+        # ══════════════════════════════════════════
+        # PORTA 2 — assinaturas (pagante direto)
+        # ══════════════════════════════════════════
+        rows_ass = await sb_get(client, "assinaturas",
+            f"telefone=like.%25{sufixo}%25&select=id,nome,ativo,plano")
+        if rows_ass:
+            ass = rows_ass[0]
+            if not ass.get("ativo", False):
+                print(f"🚫 [PORTA 2 — ASSINATURA] {tel_limpo} — assinatura inativa")
+                return False, {"_acesso_motivo": "assinatura_inativa"}, None
+            user_id = ass.get("id")
+            config  = await buscar_config_usuario(client, user_id) if user_id else {}
+            config["_acesso_motivo"] = "assinatura_ativa"
             config["_is_membro"]     = False
-            print(f"👤 [PERFIL] Dono encontrado: user_id={user_id} | personalidade={config.get('personalidade_bot','?')} | dicas={config.get('dicas_economia','?')}")
+            print(f"💳 [PORTA 2 — ASSINATURA] {tel_limpo} | {ass.get('nome','?')} | plano={ass.get('plano','?')}")
             return True, config, user_id
 
-        # ── PASSO 3: é membro da família? ────────────────────────
-        config_membro, user_id_membro, dono_id = await buscar_config_membro(client, tel_limpo)
-        if config_membro:
-            config_membro["_acesso_motivo"] = motivo
-            print(f"👨‍👩‍👧 [PERFIL] Membro encontrado: {config_membro.get('_nome','?')} | user_id={user_id_membro} | personalidade={config_membro.get('personalidade_bot','?')}")
-            return True, config_membro, user_id_membro
+        # ══════════════════════════════════════════
+        # PORTA 3 — membros_familia (convidado)
+        # ══════════════════════════════════════════
+        rows_membro = await sb_get(client, "membros_familia",
+            f"telefone=like.%25{sufixo}%25&select=*")
+        if rows_membro:
+            membro  = rows_membro[0]
+            dono_id = membro.get("dono_id")
 
-    # Liberado no admin mas não encontrado em nenhuma tabela de usuários
-    print(f"ℹ️  [ADMIN] {tel_limpo} liberado ({motivo}) mas sem perfil no app.")
-    return True, {"_acesso_motivo": motivo}, None
+            # Verifica se o DONO tem assinatura ativa
+            dono_ativo = False
+            if dono_id:
+                rows_dono = await sb_get(client, "assinaturas",
+                    f"id=eq.{dono_id}&select=ativo")
+                if rows_dono and rows_dono[0].get("ativo"):
+                    dono_ativo = True
+                # Também aceita se o dono estiver em admin_users ativo
+                if not dono_ativo:
+                    rows_dono_adm = await sb_get(client, "admin_users",
+                        f"id=eq.{dono_id}&ativo=eq.true&select=id")
+                    if rows_dono_adm:
+                        dono_ativo = True
+
+            if not dono_ativo:
+                print(f"🚫 [PORTA 3 — MEMBRO] {tel_limpo} — dono sem assinatura ativa")
+                return False, {"_acesso_motivo": "dono_sem_assinatura"}, None
+
+            user_id_membro = membro.get("convidado_id") or str(membro.get("id"))
+            config = {
+                "personalidade_bot":   membro.get("personalidade_bot",   "friendly"),
+                "proatividade_bot":    membro.get("proatividade_bot",    "medium"),
+                "dicas_economia":      membro.get("dicas_economia",      True),
+                "sugestoes_excedente": membro.get("sugestoes_excedente", True),
+                "economia_automatica": membro.get("economia_automatica", False),
+                "metas":               membro.get("metas",               "[]"),
+                "renda_mensal":        membro.get("renda_mensal",        0),
+                "faixa_renda":         membro.get("faixa_renda",         ""),
+                "_nome":               membro.get("nome",                ""),
+                "_is_membro":          True,
+                "_dono_id":            str(dono_id) if dono_id else None,
+                "_acesso_motivo":      "membro_familia",
+            }
+            print(f"👨‍👩‍👧 [PORTA 3 — MEMBRO] {tel_limpo} | {membro.get('nome','?')} | dono_id={dono_id}")
+            return True, config, user_id_membro
+
+        # Número não encontrado em nenhuma das 3 portas
+        print(f"🚫 [ACESSO] {tel_limpo} não encontrado em nenhuma tabela")
+        return False, {"_acesso_motivo": "nao_cadastrado"}, None
 
 # ==========================================
 # 6. SUPABASE — LEITURA DE DADOS
@@ -825,17 +902,28 @@ async def _executar_apos_buffer(telefone: str):
             motivo = (config_perfil or {}).get("_acesso_motivo", "") if config_perfil else ""
             print(f"🚫 Acesso negado: {telefone} — {motivo}")
 
-            if motivo == "teste_expirado":
-                await enviar_mensagem_whatsapp(telefone,
+            msgs_bloqueio = {
+                "teste_expirado": (
                     "⏰ Seu período de teste do *ZapPoupe* chegou ao fim!\n"
                     "Para continuar usando, acesse *zappoupe.com.br* e escolha seu plano. 🚀"
-                )
-            elif motivo == "nao_cadastrado":
-                await enviar_mensagem_whatsapp(telefone,
+                ),
+                "assinatura_inativa": (
+                    "😕 Sua assinatura do *ZapPoupe* está inativa.\n"
+                    "Renove em *zappoupe.com.br* para voltar a usar! 💳"
+                ),
+                "dono_sem_assinatura": (
+                    "😕 O titular da sua conta familiar não tem uma assinatura ativa no *ZapPoupe*.\n"
+                    "Peça para ele renovar em *zappoupe.com.br*."
+                ),
+                "nao_cadastrado": (
                     "👋 Olá! Você ainda não tem acesso ao *ZapPoupe*.\n"
                     "Acesse *zappoupe.com.br* para começar! 😊"
-                )
-            # Para outros motivos (inativo, sem_plano) não envia nada — silencioso
+                ),
+            }
+            msg_bloqueio = msgs_bloqueio.get(motivo)
+            if msg_bloqueio:
+                await enviar_mensagem_whatsapp(telefone, msg_bloqueio)
+            # inativo, sem_plano, erro_teste → silencioso
             return
 
         # Aviso de teste acabando (últimos 2 dias)
@@ -882,6 +970,130 @@ def agendar_buffer(telefone: str, mensagem: str):
     # Cria nova task com timer zerado
     nova_task = asyncio.create_task(_executar_apos_buffer(telefone))
     buffer_tasks[telefone] = nova_task
+
+
+# ==========================================
+# SUGESTÃO DE EXCEDENTES — chamada pelo pg_cron
+# Roda dia 1-5 de cada mês às 09:00
+# ==========================================
+async def gerar_sugestao_excedentes(user_id: str, telefone: str, config: dict):
+    """
+    Busca receitas e despesas do mês anterior e gera uma sugestão
+    personalizada de como usar o excedente.
+    """
+    from datetime import date
+    hoje  = date.today()
+    # Mês anterior
+    if hoje.month == 1:
+        mes_ant, ano_ant = 12, hoje.year - 1
+    else:
+        mes_ant, ano_ant = hoje.month - 1, hoje.year
+
+    inicio = f"{ano_ant}-{mes_ant:02d}-01T00:00:00"
+    fim    = f"{hoje.year}-{hoje.month:02d}-01T00:00:00"
+
+    async with httpx.AsyncClient() as client:
+        filtros_r = f"user_id=eq.{user_id}&type=eq.income&date=gte.{inicio}&date=lt.{fim}"
+        filtros_d = f"user_id=eq.{user_id}&type=eq.expense&date=gte.{inicio}&date=lt.{fim}"
+        receitas  = await sb_get(client, "transactions", filtros_r)
+        despesas  = await sb_get(client, "transactions", filtros_d)
+
+    total_r   = sum(float(r.get("amount", 0)) for r in receitas)
+    total_d   = sum(float(r.get("amount", 0)) for r in despesas)
+    excedente = total_r - total_d
+
+    if excedente <= 0:
+        print(f"ℹ️  [EXCEDENTE] {telefone} — sem excedente no mês anterior, pulando sugestão.")
+        return
+
+    personalidade = config.get("personalidade_bot", "friendly")
+    metas_json    = config.get("metas", "[]")
+    nome          = config.get("_nome", "")
+    cumprimento   = f"Oi {nome}! 👋\n\n" if nome else "👋\n\n"
+
+    # Monta prompt pra sugestão inteligente
+    prompt_sugestao = f"""Você é um assistente financeiro pelo WhatsApp.
+Personalidade: {PROMPTS_PERSONALIDADE.get(personalidade, PROMPTS_PERSONALIDADE['friendly'])}
+
+O usuário teve um excedente de R$ {excedente:.2f} no mês anterior
+(Receitas: R$ {total_r:.2f} | Despesas: R$ {total_d:.2f}).
+
+Metas do usuário: {metas_json}
+
+Crie uma mensagem curta (máx 5 linhas) de sugestão de como usar esse excedente de forma inteligente.
+Mencione as metas se existirem. Use emojis com moderação. Seja direto e motivador.
+Termine sempre dizendo que pode gerenciar melhor pelo ZapPoupe em zappoupe.com.br."""
+
+    try:
+        response = await client_openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt_sugestao}],
+            max_tokens=300,
+            temperature=0.8
+        )
+        sugestao = response.choices[0].message.content.strip()
+        msg_final = f"{cumprimento}📊 *Resumo do mês anterior:*\n💰 Receitas: {formatar_moeda(total_r)}\n💸 Despesas: {formatar_moeda(total_d)}\n✨ Excedente: *{formatar_moeda(excedente)}*\n\n{sugestao}"
+        await enviar_mensagem_whatsapp(telefone, msg_final)
+        print(f"✅ [EXCEDENTE] Sugestão enviada para {telefone}")
+    except Exception as e:
+        print(f"❌ [EXCEDENTE] Erro ao gerar sugestão para {telefone}: {e}")
+
+
+@app.post("/cron/excedentes")
+async def webhook_excedentes(request: Request, background_tasks: BackgroundTasks):
+    """
+    Chamado pelo pg_cron do Supabase todo dia 1-5 às 09:00.
+    Dispara sugestões apenas para usuários com sugestoes_excedente=true.
+    Protegido por CRON_SECRET no header Authorization.
+    """
+    # Segurança básica — valida o secret
+    cron_secret = os.getenv("CRON_SECRET", "")
+    auth_header = request.headers.get("Authorization", "")
+    if cron_secret and auth_header != f"Bearer {cron_secret}":
+        print("🚫 [CRON] Requisição não autorizada!")
+        return {"status": "unauthorized"}
+
+    hoje = date.today()
+    if not (1 <= hoje.day <= 5):
+        print(f"ℹ️  [CRON] Fora do período (dia {hoje.day}), ignorando.")
+        return {"status": "fora_do_periodo"}
+
+    print(f"🔔 [CRON] Rodando sugestão de excedentes — {hoje.isoformat()}")
+
+    async with httpx.AsyncClient() as client:
+        # Busca todos usuários com sugestoes_excedente=true
+        rows_config = await sb_get(client, "configuracoes_usuario", "sugestoes_excedente=eq.true&select=id")
+        # Também busca membros da família com sugestoes_excedente=true
+        rows_membros = await sb_get(client, "membros_familia",
+            "sugestoes_excedente=eq.true&select=convidado_id,dono_id,telefone,nome,personalidade_bot,metas")
+
+    # Processa donos
+    for row in rows_config:
+        uid = row.get("id")
+        if not uid:
+            continue
+        # Busca telefone na tabela assinaturas
+        async with httpx.AsyncClient() as client:
+            tel_rows = await sb_get(client, "assinaturas", f"id=eq.{uid}&select=telefone")
+            config   = await buscar_config_usuario(client, uid)
+        if tel_rows and tel_rows[0].get("telefone"):
+            tel = tel_rows[0]["telefone"]
+            background_tasks.add_task(gerar_sugestao_excedentes, uid, tel, config)
+
+    # Processa membros
+    for m in rows_membros:
+        tel     = m.get("telefone")
+        user_id = m.get("convidado_id") or m.get("dono_id")
+        if not tel or not user_id:
+            continue
+        config_m = {
+            "personalidade_bot": m.get("personalidade_bot", "friendly"),
+            "metas":             m.get("metas", "[]"),
+            "_nome":             m.get("nome", ""),
+        }
+        background_tasks.add_task(gerar_sugestao_excedentes, user_id, tel, config_m)
+
+    return {"status": "ok", "dia": hoje.day}
 
 
 @app.post("/webhook")
