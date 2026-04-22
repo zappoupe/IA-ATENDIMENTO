@@ -81,12 +81,11 @@ async def enviar_mensagem_whatsapp(telefone: str, texto: str):
             print(f"❌ [ERRO ENVIO] {telefone_str}: {e}")
 
 def extrair_essencia_telefone(telefone: str) -> str:
+    """Remove DDI 55 e todos os não-dígitos. Ex: (22) 99815-1575 → 22998151575"""
     if not telefone: return ""
     num = re.sub(r'\D', '', str(telefone))
     if num.startswith('55') and len(num) >= 12:
         num = num[2:]
-    if len(num) >= 10:
-        return f"{num[:2]}{num[-8:]}"
     return num
 
 # ==========================================
@@ -147,7 +146,7 @@ async def buscar_config_membro(client, telefone_limpo: str) -> tuple[dict, str |
     Retorna (config_do_membro, user_id_do_membro, dono_id)
     O membro tem suas próprias configs (personalidade, metas, etc) dentro da própria linha.
     """
-    sufixo = telefone_limpo[-8:]
+    sufixo = telefone_limpo[-9:] if len(telefone_limpo) >= 9 else telefone_limpo
     rows = await sb_get(client, "membros_familia",
         f"telefone=like.%25{sufixo}%25&select=id,dono_id,convidado_id,nome,personalidade_bot,proatividade_bot,dicas_economia,sugestoes_excedente,economia_automatica,metas,renda_mensal,faixa_renda")
     if not rows:
@@ -177,7 +176,7 @@ async def verificar_admin_user(client, telefone_limpo: str) -> tuple[bool, str]:
     Retorna (liberado: bool, motivo_bloqueio: str)
     """
     # Busca pelo sufixo dos últimos 8 dígitos (cobre variações de DDI)
-    sufixo = telefone_limpo[-8:]
+    sufixo = telefone_limpo[-9:] if len(telefone_limpo) >= 9 else telefone_limpo
     rows = await sb_get(client, "admin_users", f"celular=like.%25{sufixo}%25&select=*")
 
     if not rows:
@@ -239,7 +238,8 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
         return None, None, None
 
     tel_limpo = extrair_essencia_telefone(telefone_zapi)
-    sufixo    = tel_limpo[-8:]
+    # Usa sufixo de 9 dígitos (número sem DDD) pra bater com qualquer formatação do banco
+    sufixo = tel_limpo[-9:] if len(tel_limpo) >= 9 else tel_limpo
 
     async with httpx.AsyncClient() as client:
 
@@ -275,7 +275,7 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
         # PORTA 2 — assinaturas (pagante direto)
         # ══════════════════════════════════════════
         rows_ass = await sb_get(client, "assinaturas",
-            f"telefone=like.%25{sufixo}%25&select=id,nome,ativo,plano")
+            f"telefone=like.%25{sufixo}%25&select=id,nome,ativo,plano,telefone")
         if rows_ass:
             ass = rows_ass[0]
             if not ass.get("ativo", False):
@@ -292,7 +292,7 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
         # PORTA 3 — membros_familia (convidado)
         # ══════════════════════════════════════════
         rows_membro = await sb_get(client, "membros_familia",
-            f"telefone=like.%25{sufixo}%25&select=*")
+            f"telefone=like.%25{sufixo}%25&select=*&status=eq.ativo")
         if rows_membro:
             membro  = rows_membro[0]
             dono_id = membro.get("dono_id")
