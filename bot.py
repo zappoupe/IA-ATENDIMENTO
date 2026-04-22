@@ -88,6 +88,19 @@ def extrair_essencia_telefone(telefone: str) -> str:
         num = num[2:]
     return num
 
+def obter_filtro_telefone_robusto(coluna: str, telefone: str) -> str:
+    """
+    Cria um filtro ilike para o Supabase que ignora formatações (como -, (), espaços).
+    Usa o curinga '*' do PostgREST (equivalente a '%') entre cada dígito.
+    """
+    tel_limpo = extrair_essencia_telefone(telefone)
+    if not tel_limpo:
+        return f"{coluna}=is.null"
+    # Foca nos últimos 9 dígitos para ignorar inconsistências de DDD/DDI
+    sufixo = tel_limpo[-9:] if len(tel_limpo) >= 9 else tel_limpo
+    padrao = "*" + "*".join(list(sufixo)) + "*"
+    return f"{coluna}=ilike.{padrao}"
+
 # ==========================================
 # 4. SUPABASE — HELPERS BASE
 # ==========================================
@@ -144,11 +157,10 @@ async def buscar_config_membro(client, telefone_limpo: str) -> tuple[dict, str |
     """
     Busca membro na tabela membros_familia pelo telefone.
     Retorna (config_do_membro, user_id_do_membro, dono_id)
-    O membro tem suas próprias configs (personalidade, metas, etc) dentro da própria linha.
     """
-    sufixo = telefone_limpo[-9:] if len(telefone_limpo) >= 9 else telefone_limpo
+    filtro = obter_filtro_telefone_robusto("telefone", telefone_limpo)
     rows = await sb_get(client, "membros_familia",
-        f"select=id,dono_id,convidado_id,nome,personalidade_bot,proatividade_bot,dicas_economia,sugestoes_excedente,economia_automatica,metas,renda_mensal,faixa_renda&telefone=like.%25{sufixo}%25")
+        f"select=id,dono_id,convidado_id,nome,personalidade_bot,proatividade_bot,dicas_economia,sugestoes_excedente,economia_automatica,metas,renda_mensal,faixa_renda&{filtro}")
     if not rows:
         return {}, None, None
     m = rows[0]
@@ -170,51 +182,6 @@ async def buscar_config_membro(client, telefone_limpo: str) -> tuple[dict, str |
     }
     return config, user_id_membro, dono_id
 
-async def verificar_admin_user(client, telefone_limpo: str) -> tuple[bool, str]:
-    """
-    Verifica na tabela admin_users se o número tem acesso.
-    Retorna (liberado: bool, motivo_bloqueio: str)
-    """
-    # Busca pelo sufixo dos últimos 8 dígitos (cobre variações de DDI)
-    sufixo = telefone_limpo[-9:] if len(telefone_limpo) >= 9 else telefone_limpo
-    rows = await sb_get(client, "admin_users", f"select=*&celular=like.%25{sufixo}%25")
-
-    if not rows:
-        return False, "nao_cadastrado"
-
-    user = rows[0]
-
-    # Inativo no admin
-    if not user.get("ativo", True):
-        return False, "inativo"
-
-    # Vitalício — sempre libera
-    if user.get("plano_vitalicio"):
-        print(f"♾️  [ADMIN] {telefone_limpo} — plano vitalício ativo")
-        return True, "vitalicio"
-
-    # Usuário de teste — verifica período
-    if user.get("usuario_teste"):
-        dias_teste  = int(user.get("dias_teste") or 0)
-        criado_em   = user.get("criado_em", "")
-        try:
-            # Parse da data de criação (ISO 8601)
-            criado_dt   = datetime.fromisoformat(criado_em.replace("Z", "+00:00"))
-            dias_passados = (datetime.now(criado_dt.tzinfo) - criado_dt).days
-            if dias_passados <= dias_teste:
-                restantes = dias_teste - dias_passados
-                print(f"🧪 [ADMIN] {telefone_limpo} — teste: {dias_passados}/{dias_teste} dias ({restantes} restantes)")
-                return True, f"teste_{restantes}"
-            else:
-                print(f"⛔ [ADMIN] {telefone_limpo} — teste expirado ({dias_passados} dias, limite {dias_teste})")
-                return False, "teste_expirado"
-        except Exception as e:
-            print(f"⚠️ [ADMIN] Erro ao calcular período de teste: {e}")
-            return False, "erro_teste"
-
-    # Cadastrado mas sem plano definido
-    return False, "sem_plano"
-
 async def verificar_acesso_e_perfil(telefone_zapi: str):
     """
     Retorna (tem_acesso: bool, config: dict, user_id: str | None)
@@ -222,60 +189,77 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
     3 portas de entrada INDEPENDENTES — basta estar em UMA delas:
 
     PORTA 1 — admin_users (celular)
-        Pessoas adicionadas manualmente (teste ou vitalício).
-        Verifica ativo=true + prazo de teste se aplicável.
-
     PORTA 2 — assinaturas (telefone)
-        Quem pagou de verdade. Verifica ativo=true.
-        Config vem de configuracoes_usuario pelo id.
-
     PORTA 3 — membros_familia (telefone)
-        Convidados da família. Só libera se o DONO (dono_id)
-        tiver assinatura ativa em assinaturas.
-        Config vem da própria linha do membro.
     """
     if not SUPABASE_URL:
         return None, None, None
 
     tel_limpo = extrair_essencia_telefone(telefone_zapi)
-    # Usa sufixo de 9 dígitos (número sem DDD) pra bater com qualquer formatação do banco
-    sufixo = tel_limpo[-9:] if len(tel_limpo) >= 9 else tel_limpo
 
     async with httpx.AsyncClient() as client:
 
         # ══════════════════════════════════════════
         # PORTA 1 — admin_users (controle manual)
         # ══════════════════════════════════════════
-        rows_admin = await sb_get(client, "admin_users",
-            f"select=*&celular=like.%25{sufixo}%25")
+        filtro_admin = obter_filtro_telefone_robusto("celular", telefone_zapi)
+        rows_admin = await sb_get(client, "admin_users", f"select=*&{filtro_admin}")
+        
         if rows_admin:
             adm = rows_admin[0]
-            if adm.get("ativo"):
-                liberado, motivo = await verificar_admin_user(client, tel_limpo)
-                if liberado:
-                    # Tenta pegar config real pelo email
-                    email_adm = adm.get("email", "")
-                    user_id   = None
-                    config    = {}
-                    if email_adm:
-                        ass_rows = await sb_get(client, "assinaturas",
-                            f"email=eq.{email_adm}&select=id,ativo")
-                        if ass_rows:
-                            user_id = ass_rows[0].get("id")
-                            config  = await buscar_config_usuario(client, user_id) if user_id else {}
-                    config["_acesso_motivo"] = motivo
-                    config["_is_membro"]     = False
-                    print(f"🔑 [PORTA 1 — ADMIN] {tel_limpo} | {adm.get('nome','?')} | motivo={motivo}")
-                    return True, config, user_id
-                else:
-                    print(f"🚫 [PORTA 1 — ADMIN] {tel_limpo} bloqueado — {motivo}")
-                    return False, {"_acesso_motivo": motivo}, None
+            liberado = False
+            motivo = ""
+
+            if not adm.get("ativo", True):
+                liberado, motivo = False, "inativo"
+            elif adm.get("plano_vitalicio"):
+                print(f"♾️  [ADMIN] {tel_limpo} — plano vitalício ativo")
+                liberado, motivo = True, "vitalicio"
+            elif adm.get("usuario_teste"):
+                dias_teste  = int(adm.get("dias_teste") or 0)
+                criado_em   = adm.get("criado_em", "")
+                try:
+                    # Parse da data de criação (ISO 8601)
+                    criado_dt   = datetime.fromisoformat(criado_em.replace("Z", "+00:00"))
+                    dias_passados = (datetime.now(criado_dt.tzinfo) - criado_dt).days
+                    if dias_passados <= dias_teste:
+                        restantes = dias_teste - dias_passados
+                        print(f"🧪 [ADMIN] {tel_limpo} — teste: {dias_passados}/{dias_teste} dias ({restantes} restantes)")
+                        liberado, motivo = True, f"teste_{restantes}"
+                    else:
+                        print(f"⛔ [ADMIN] {tel_limpo} — teste expirado ({dias_passados} dias, limite {dias_teste})")
+                        liberado, motivo = False, "teste_expirado"
+                except Exception as e:
+                    print(f"⚠️ [ADMIN] Erro ao calcular período de teste: {e}")
+                    liberado, motivo = False, "erro_teste"
+            else:
+                liberado, motivo = False, "sem_plano"
+
+            if liberado:
+                # Tenta pegar config real pelo email
+                email_adm = adm.get("email", "")
+                user_id   = None
+                config    = {}
+                if email_adm:
+                    ass_rows = await sb_get(client, "assinaturas",
+                        f"email=eq.{email_adm}&select=id,ativo")
+                    if ass_rows:
+                        user_id = ass_rows[0].get("id")
+                        config  = await buscar_config_usuario(client, user_id) if user_id else {}
+                config["_acesso_motivo"] = motivo
+                config["_is_membro"]     = False
+                print(f"🔑 [PORTA 1 — ADMIN] {tel_limpo} | {adm.get('nome','?')} | motivo={motivo}")
+                return True, config, user_id
+            else:
+                print(f"🚫 [PORTA 1 — ADMIN] {tel_limpo} bloqueado — {motivo}")
+                return False, {"_acesso_motivo": motivo}, None
 
         # ══════════════════════════════════════════
         # PORTA 2 — assinaturas (pagante direto)
         # ══════════════════════════════════════════
+        filtro_ass = obter_filtro_telefone_robusto("telefone", telefone_zapi)
         rows_ass = await sb_get(client, "assinaturas",
-            f"select=id,nome,ativo,plano,telefone&telefone=like.%25{sufixo}%25")
+            f"select=id,nome,ativo,plano,telefone&{filtro_ass}")
         if rows_ass:
             ass = rows_ass[0]
             if not ass.get("ativo", False):
@@ -291,8 +275,8 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
         # ══════════════════════════════════════════
         # PORTA 3 — membros_familia (convidado)
         # ══════════════════════════════════════════
-        rows_membro = await sb_get(client, "membros_familia",
-            f"select=*&telefone=like.%25{sufixo}%25")
+        filtro_membro = obter_filtro_telefone_robusto("telefone", telefone_zapi)
+        rows_membro = await sb_get(client, "membros_familia", f"select=*&{filtro_membro}")
         if rows_membro:
             membro  = rows_membro[0]
             dono_id = membro.get("dono_id")
