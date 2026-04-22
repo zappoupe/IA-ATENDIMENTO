@@ -18,7 +18,8 @@ OPENAI_API_KEY   = os.getenv('OPENAI_API_KEY')
 ZAPI_INSTANCE_ID = os.getenv('ZAPI_INSTANCE_ID')
 ZAPI_TOKEN       = os.getenv('ZAPI_TOKEN')
 SUPABASE_URL     = os.getenv('SUPABASE_URL')
-SUPABASE_KEY     = os.getenv('SUPABASE_KEY')
+SUPABASE_KEY         = os.getenv('SUPABASE_KEY')
+SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')  # service_role key — bypassa RLS
 SITE_URL         = os.getenv('SITE_URL', 'app.seusite.com.br')
 
 client_openai = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -92,9 +93,11 @@ def extrair_essencia_telefone(telefone: str) -> str:
 # 4. SUPABASE — HELPERS BASE
 # ==========================================
 def sb_headers() -> dict:
+    # Usa service role key pra bypassar RLS — bot roda server-side, é seguro
+    key = SUPABASE_SERVICE_KEY or SUPABASE_KEY
     return {
-        "apikey":        SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apikey":        key,
+        "Authorization": f"Bearer {key}",
         "Content-Type":  "application/json",
         "Prefer":        "return=representation"
     }
