@@ -148,7 +148,7 @@ async def buscar_config_membro(client, telefone_limpo: str) -> tuple[dict, str |
     """
     sufixo = telefone_limpo[-9:] if len(telefone_limpo) >= 9 else telefone_limpo
     rows = await sb_get(client, "membros_familia",
-        f"telefone=like.%25{sufixo}%25&select=id,dono_id,convidado_id,nome,personalidade_bot,proatividade_bot,dicas_economia,sugestoes_excedente,economia_automatica,metas,renda_mensal,faixa_renda")
+        f"select=id,dono_id,convidado_id,nome,personalidade_bot,proatividade_bot,dicas_economia,sugestoes_excedente,economia_automatica,metas,renda_mensal,faixa_renda&telefone=like.%25{sufixo}%25")
     if not rows:
         return {}, None, None
     m = rows[0]
@@ -177,7 +177,7 @@ async def verificar_admin_user(client, telefone_limpo: str) -> tuple[bool, str]:
     """
     # Busca pelo sufixo dos últimos 8 dígitos (cobre variações de DDI)
     sufixo = telefone_limpo[-9:] if len(telefone_limpo) >= 9 else telefone_limpo
-    rows = await sb_get(client, "admin_users", f"celular=like.%25{sufixo}%25&select=*")
+    rows = await sb_get(client, "admin_users", f"select=*&celular=like.%25{sufixo}%25")
 
     if not rows:
         return False, "nao_cadastrado"
@@ -247,7 +247,7 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
         # PORTA 1 — admin_users (controle manual)
         # ══════════════════════════════════════════
         rows_admin = await sb_get(client, "admin_users",
-            f"celular=like.%25{sufixo}%25&select=*")
+            f"select=*&celular=like.%25{sufixo}%25")
         if rows_admin:
             adm = rows_admin[0]
             if adm.get("ativo"):
@@ -275,7 +275,7 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
         # PORTA 2 — assinaturas (pagante direto)
         # ══════════════════════════════════════════
         rows_ass = await sb_get(client, "assinaturas",
-            f"telefone=like.%25{sufixo}%25&select=id,nome,ativo,plano,telefone")
+            f"select=id,nome,ativo,plano,telefone&telefone=like.%25{sufixo}%25")
         if rows_ass:
             ass = rows_ass[0]
             if not ass.get("ativo", False):
@@ -292,7 +292,7 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
         # PORTA 3 — membros_familia (convidado)
         # ══════════════════════════════════════════
         rows_membro = await sb_get(client, "membros_familia",
-            f"telefone=like.%25{sufixo}%25&select=*&status=eq.ativo")
+            f"select=*&telefone=like.%25{sufixo}%25")
         if rows_membro:
             membro  = rows_membro[0]
             dono_id = membro.get("dono_id")
