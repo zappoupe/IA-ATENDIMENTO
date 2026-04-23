@@ -20,7 +20,7 @@ ZAPI_TOKEN       = os.getenv('ZAPI_TOKEN')
 SUPABASE_URL     = os.getenv('SUPABASE_URL')
 SUPABASE_KEY         = os.getenv('SUPABASE_KEY')
 SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')  # service_role key — bypassa RLS
-SITE_URL         = os.getenv('SITE_URL', 'app.seusite.com.br')
+SITE_URL         = os.getenv('SITE_URL', 'https://sistema-do-usuario-production.up.railway.app/')
 
 client_openai = AsyncOpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
