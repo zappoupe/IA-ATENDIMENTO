@@ -19,7 +19,7 @@ ZAPI_INSTANCE_ID = os.getenv('ZAPI_INSTANCE_ID')
 ZAPI_TOKEN       = os.getenv('ZAPI_TOKEN')
 SUPABASE_URL     = os.getenv('SUPABASE_URL')
 SUPABASE_KEY         = os.getenv('SUPABASE_KEY')
-SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')  # service_role key — bypassa RLS
+SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY') 
 SITE_URL         = os.getenv('SITE_URL', 'https://sistema-do-usuario-production.up.railway.app/')
 
 client_openai = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -739,6 +739,22 @@ O JSON deve conter EXATAMENTE estas chaves:
     • Finança fixa sem valor: "Qual o valor?"
     Use a personalidade definida na pergunta. Se não falta nada, coloque null.
 - 'resposta_amigavel': string — SEMPRE preencha com a resposta ao usuário. Se pendente=true, use apenas a pergunta do campo 'pergunta' como resposta. Nunca deixe vazio.
+
+FORMATO OBRIGATÓRIO para 'resposta_amigavel' quando tipo for Receita, Despesa, Receita_Fixa ou Despesa_Fixa:
+
+  • Se personalidade=friendly: uma frase curta e descontraída comentando o gasto/receita (max 2 linhas), depois o card.
+  • Se personalidade=direct: sem comentário, apenas o card.
+  • Se personalidade=formal: uma frase formal e breve confirmando o registro, depois o card.
+
+Card (SEMPRE igual, independente da personalidade):
+📋 *Resumo da [Despesa/Receita]:*
+
+📝 *Descrição:* {valor do campo descricao}
+💰 *Valor:* R$ {valor formatado com vírgula, ex: 28,00}
+🏷️ *Categoria:* {valor do campo categoria}
+📅 *Data:* {data de hoje no formato DD/MM/AAAA}
+
+REGRAS DO CARD: inclua APENAS esses 4 campos. NÃO adicione Status, NÃO adicione outros campos.
 """
 
     mensagens_api = [{"role": "system", "content": system_prompt}]
@@ -812,21 +828,8 @@ O JSON deve conter EXATAMENTE estas chaves:
     # ──────────────────────────────────────────────
     # REGISTROS — salva no banco
     # ──────────────────────────────────────────────
-    valor_bruto = dados.get('valor')
-    try:
-        valor = float(valor_bruto) if valor_bruto is not None else 0.0
-    except (ValueError, TypeError):
-        valor = 0.0
-
-    categoria  = dados.get('categoria')  or 'Geral'
-    data_rec   = dados.get('data_recorrencia') or 'Não especificada'
-    descricao  = dados.get('descricao', '')
-    is_fixa_label = "🔄 **(FIXA)**" if dados.get('fixa') or tipo_str in ['Receita_Fixa', 'Despesa_Fixa'] else ""
-
-    salvo = False
-
     if tipo_str in ['Receita', 'Despesa']:
-        salvo = await salvar_transacao(user_id, dados)
+        await salvar_transacao(user_id, dados)
         # Contador de proatividade
         contador_lembretes[telefone] += 1
         if contador_lembretes[telefone] >= limite_para_lembrar:
@@ -836,13 +839,13 @@ O JSON deve conter EXATAMENTE estas chaves:
             print(f"🤫 [CONTADOR] {contador_lembretes[telefone]}/{limite_para_lembrar}")
 
     elif tipo_str in ['Receita_Fixa', 'Despesa_Fixa']:
-        salvo = await salvar_financa_fixa(user_id, dados)
+        await salvar_financa_fixa(user_id, dados)
         contador_lembretes[telefone] += 1
         if contador_lembretes[telefone] >= limite_para_lembrar:
             contador_lembretes[telefone] = 0
 
     elif tipo_str == 'Lembrete':
-        salvo = await salvar_lembrete(user_id, dados)
+        await salvar_lembrete(user_id, dados)
         print(f"⏸️ [CONTADOR] Lembrete — contador pausado em {contador_lembretes[telefone]}/{limite_para_lembrar}")
         # Lembrete: só a mensagem amigável, sem card de debug
         return resposta_bot
@@ -852,13 +855,7 @@ O JSON deve conter EXATAMENTE estas chaves:
         # Meta: só a mensagem amigável, sem card de debug
         return resposta_bot
 
-    # ── Card financeiro (Receita, Despesa, Receita_Fixa, Despesa_Fixa) ──
-    icone_salvo = "✅" if salvo else "⚠️"
-
-    sufixo_data = f" · {data_rec}" if data_rec != 'Não especificada' else ''
-    categoria_linha = f"_{categoria}{sufixo_data}_\n\n" if categoria and categoria != 'Geral' else ''
-
-    return f"{categoria_linha}{resposta_bot}"
+    return resposta_bot
 
 # ==========================================
 # 10. FLUXO PRINCIPAL COM BUFFER (DEBOUNCE)
