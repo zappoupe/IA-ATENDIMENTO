@@ -35,6 +35,7 @@ contador_lembretes  = {}
 BUFFER_SEGUNDOS   = 10          # tempo de espera antes de processar
 buffer_mensagens  = {}          # telefone -> lista de textos acumulados
 buffer_tasks      = {}          # telefone -> asyncio.Task ativo
+buffer_imagens    = {}          # telefone -> URL da última imagem pendente
 
 # ==========================================
 # 2. PERSONALIDADE & PROATIVIDADE
@@ -651,7 +652,46 @@ async def responder_consulta(inten: str, user_id: str, personalidade: str) -> st
 # ==========================================
 # 9. INTELIGÊNCIA ARTIFICIAL — NÚCLEO
 # ==========================================
-async def analisar_mensagem_financeira(mensagem_texto: str, telefone: str, config: dict, user_id: str) -> str:
+def montar_card(dados: dict, tipo_str: str) -> str:
+    tipo_label = "Receita" if "Receita" in tipo_str else "Despesa"
+    hoje = date.today().strftime("%d/%m/%Y")
+    try:
+        valor_fmt = f"{float(dados.get('valor') or 0):,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
+    except Exception:
+        valor_fmt = "0,00"
+    descricao = dados.get('descricao') or '-'
+    categoria = dados.get('categoria') or 'Geral'
+    return (
+        f"\n\n📋 *Resumo da {tipo_label}:*\n\n"
+        f"📝 *Descrição:* {descricao}\n"
+        f"💰 *Valor:* R$ {valor_fmt}\n"
+        f"🏷️ *Categoria:* {categoria}\n"
+        f"📅 *Data:* {hoje}"
+    )
+
+
+async def transcrever_audio(url: str) -> str:
+    from io import BytesIO
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.get(url)
+    if not resp.is_success:
+        print(f"❌ [AUDIO] Falha ao baixar áudio: {resp.status_code}")
+        return ""
+    audio_bytes = BytesIO(resp.content)
+    audio_bytes.name = "audio.ogg"
+    try:
+        transcricao = await client_openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_bytes,
+            language="pt"
+        )
+        return transcricao.text.strip()
+    except Exception as e:
+        print(f"❌ [AUDIO] Erro na transcrição: {e}")
+        return ""
+
+
+async def analisar_mensagem_financeira(mensagem_texto: str, telefone: str, config: dict, user_id: str, imagem_url: str = None) -> str:
     if telefone not in historico_usuarios:
         historico_usuarios[telefone] = deque(maxlen=10)
     if telefone not in contador_lembretes:
@@ -739,30 +779,31 @@ O JSON deve conter EXATAMENTE estas chaves:
     • Finança fixa sem valor: "Qual o valor?"
     Use a personalidade definida na pergunta. Se não falta nada, coloque null.
 - 'resposta_amigavel': string — SEMPRE preencha com a resposta ao usuário. Se pendente=true, use apenas a pergunta do campo 'pergunta' como resposta. Nunca deixe vazio.
-
-FORMATO OBRIGATÓRIO para 'resposta_amigavel' quando tipo for Receita, Despesa, Receita_Fixa ou Despesa_Fixa:
-
-  • Se personalidade=friendly: uma frase curta e descontraída comentando o gasto/receita (max 2 linhas), depois o card.
-  • Se personalidade=direct: sem comentário, apenas o card.
-  • Se personalidade=formal: uma frase formal e breve confirmando o registro, depois o card.
-
-Card (SEMPRE igual, independente da personalidade):
-📋 *Resumo da [Despesa/Receita]:*
-
-📝 *Descrição:* {valor do campo descricao}
-💰 *Valor:* R$ {valor formatado com vírgula, ex: 28,00}
-🏷️ *Categoria:* {valor do campo categoria}
-📅 *Data:* {data de hoje no formato DD/MM/AAAA}
-
-REGRAS DO CARD: inclua APENAS esses 4 campos. NÃO adicione Status, NÃO adicione outros campos.
+  Para tipos Receita/Despesa/Receita_Fixa/Despesa_Fixa, escreva APENAS um comentário curto de acordo com a personalidade:
+    - friendly: frase descontraída e divertida comentando o gasto/receita (max 2 linhas).
+    - direct: frase mínima confirmando o registro (ex: "Anotado!").
+    - formal: frase formal e breve confirmando o registro.
+  NÃO inclua o card/resumo na resposta_amigavel — ele é gerado automaticamente pelo sistema.
 """
 
     mensagens_api = [{"role": "system", "content": system_prompt}]
     mensagens_api.extend(historico_usuarios[telefone])
-    mensagens_api.append({"role": "user", "content": mensagem_texto})
+
+    # Monta conteúdo do usuário — com imagem usa GPT-4o (vision)
+    if imagem_url:
+        user_content = [
+            {"type": "text", "text": mensagem_texto or "Analise essa imagem financeiramente."},
+            {"type": "image_url", "image_url": {"url": imagem_url}}
+        ]
+        model_ia = "gpt-4o"
+    else:
+        user_content = mensagem_texto
+        model_ia = "gpt-3.5-turbo"
+
+    mensagens_api.append({"role": "user", "content": user_content})
 
     response = await client_openai.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model=model_ia,
         response_format={"type": "json_object"},
         messages=mensagens_api,
         temperature=0.7
@@ -847,15 +888,13 @@ REGRAS DO CARD: inclua APENAS esses 4 campos. NÃO adicione Status, NÃO adicion
     elif tipo_str == 'Lembrete':
         await salvar_lembrete(user_id, dados)
         print(f"⏸️ [CONTADOR] Lembrete — contador pausado em {contador_lembretes[telefone]}/{limite_para_lembrar}")
-        # Lembrete: só a mensagem amigável, sem card de debug
         return resposta_bot
 
     elif tipo_str == 'Meta':
         print(f"⏸️ [CONTADOR] Meta — contador pausado.")
-        # Meta: só a mensagem amigável, sem card de debug
         return resposta_bot
 
-    return resposta_bot
+    return resposta_bot + montar_card(dados, tipo_str)
 
 # ==========================================
 # 10. FLUXO PRINCIPAL COM BUFFER (DEBOUNCE)
@@ -868,7 +907,8 @@ async def _executar_apos_buffer(telefone: str):
     await asyncio.sleep(BUFFER_SEGUNDOS)
 
     # Pega e limpa o buffer atomicamente
-    mensagens = buffer_mensagens.pop(telefone, [])
+    mensagens   = buffer_mensagens.pop(telefone, [])
+    imagem_url  = buffer_imagens.pop(telefone, None)
     buffer_tasks.pop(telefone, None)
 
     if not mensagens:
@@ -923,7 +963,7 @@ async def _executar_apos_buffer(telefone: str):
             except:
                 pass
 
-        msg_resposta = await analisar_mensagem_financeira(texto_completo, telefone, config_perfil, user_id)
+        msg_resposta = await analisar_mensagem_financeira(texto_completo, telefone, config_perfil, user_id, imagem_url)
         if not msg_resposta or not str(msg_resposta).strip():
             print(f"⚠️ [AVISO] Resposta vazia para {telefone}, abortando envio.")
             return
@@ -935,15 +975,16 @@ async def _executar_apos_buffer(telefone: str):
         traceback.print_exc()
 
 
-def agendar_buffer(telefone: str, mensagem: str):
+def agendar_buffer(telefone: str, mensagem: str, imagem_url: str = None):
     """
     Adiciona a mensagem ao buffer do usuário.
     Se já havia uma task rodando, cancela e reinicia o timer (debounce).
     """
-    # Acumula a mensagem
     if telefone not in buffer_mensagens:
         buffer_mensagens[telefone] = []
     buffer_mensagens[telefone].append(mensagem)
+    if imagem_url:
+        buffer_imagens[telefone] = imagem_url
 
     # Cancela task anterior se existir
     task_anterior = buffer_tasks.get(telefone)
@@ -1088,17 +1129,34 @@ async def zapi_webhook(request: Request):
 
     telefone       = payload.get("phone")
     texto_mensagem = ""
+    imagem_url     = None
 
+    # Texto
     if "text" in payload and isinstance(payload["text"], dict):
         texto_mensagem = payload["text"].get("message", "")
     elif "text" in payload and isinstance(payload["text"], str):
         texto_mensagem = payload["text"]
 
+    # Áudio — transcreve com Whisper antes de entrar no buffer
+    elif "audio" in payload and isinstance(payload["audio"], dict):
+        audio_url = payload["audio"].get("audioUrl", "")
+        if audio_url:
+            print(f"🎙️ [AUDIO] Recebido de {telefone}, transcrevendo...")
+            texto_mensagem = await transcrever_audio(audio_url)
+            if not texto_mensagem:
+                return {"status": "audio_transcription_failed"}
+            print(f"🎙️ [AUDIO] Transcrição: {texto_mensagem[:100]!r}")
+
+    # Imagem — passa URL pro GPT-4o via buffer
+    elif "image" in payload and isinstance(payload["image"], dict):
+        imagem_url     = payload["image"].get("imageUrl", "")
+        texto_mensagem = payload["image"].get("caption", "") or "Analise essa imagem."
+        print(f"🖼️ [IMAGEM] Recebida de {telefone}")
+
     if not telefone or not texto_mensagem:
         return {"status": "no_text"}
 
-    # Agenda com debounce — não usa BackgroundTasks pra poder cancelar
-    agendar_buffer(telefone, texto_mensagem)
+    agendar_buffer(telefone, texto_mensagem, imagem_url)
     return {"status": "buffered"}
 
 
