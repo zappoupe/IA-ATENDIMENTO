@@ -237,18 +237,20 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
                 liberado, motivo = False, "sem_plano"
 
             if liberado:
-                # Tenta pegar config real pelo email
-                email_adm = adm.get("email", "")
-                user_id   = None
-                config    = {}
-                if email_adm:
-                    ass_rows = await sb_get(client, "assinaturas",
-                        f"email=eq.{email_adm}&select=id,ativo")
-                    if ass_rows:
-                        user_id = ass_rows[0].get("id")
-                        config  = await buscar_config_usuario(client, user_id) if user_id else {}
-                config["_acesso_motivo"] = motivo
-                config["_is_membro"]     = False
+                user_id = str(adm.get("id")) if adm.get("id") else None
+                config = {
+                    "personalidade_bot":   adm.get("personalidade_bot",   "friendly"),
+                    "proatividade_bot":    adm.get("proatividade_bot",    "medium"),
+                    "dicas_economia":      adm.get("dicas_economia",      True),
+                    "sugestoes_excedente": adm.get("sugestoes_excedente", True),
+                    "economia_automatica": adm.get("economia_automatica", False),
+                    "metas":               adm.get("metas",               "[]"),
+                    "renda_mensal":        adm.get("renda_mensal",        0),
+                    "faixa_renda":         adm.get("faixa_renda",         ""),
+                    "_nome":               adm.get("nome",                ""),
+                    "_is_membro":          False,
+                    "_acesso_motivo":      motivo,
+                }
                 print(f"🔑 [PORTA 1 — ADMIN] {tel_limpo} | {adm.get('nome','?')} | motivo={motivo}")
                 return True, config, user_id
             else:
