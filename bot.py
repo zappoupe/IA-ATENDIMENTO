@@ -237,7 +237,7 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
                 liberado, motivo = False, "sem_plano"
 
             if liberado:
-                user_id = str(adm.get("id")) if adm.get("id") else None
+                # Config sempre lida diretamente do admin_users
                 config = {
                     "personalidade_bot":   adm.get("personalidade_bot",   "friendly"),
                     "proatividade_bot":    adm.get("proatividade_bot",    "medium"),
@@ -251,7 +251,8 @@ async def verificar_acesso_e_perfil(telefone_zapi: str):
                     "_is_membro":          False,
                     "_acesso_motivo":      motivo,
                 }
-                print(f"🔑 [PORTA 1 — ADMIN] {tel_limpo} | {adm.get('nome','?')} | motivo={motivo}")
+                user_id = str(adm.get("id")) if adm.get("id") else None
+                print(f"🔑 [PORTA 1 — ADMIN] {tel_limpo} | {adm.get('nome','?')} | motivo={motivo} | user_id={user_id}")
                 return True, config, user_id
             else:
                 print(f"🚫 [PORTA 1 — ADMIN] {tel_limpo} bloqueado — {motivo}")
@@ -386,8 +387,9 @@ async def salvar_transacao(user_id: str, dados_ia: dict) -> bool:
     async with httpx.AsyncClient() as client:
         resultado = await sb_post(client, "transactions", payload)
         if resultado:
-            print(f"✅ [TRANSACTION] Salvo: {tipo_db} R${valor:.2f}")
+            print(f"✅ [TRANSACTION] Salvo: {tipo_db} R${valor:.2f} | user_id={user_id}")
             return True
+    print(f"❌ [TRANSACTION] FALHOU ao salvar: user_id={user_id} | payload={payload}")
     return False
 
 async def salvar_financa_fixa(user_id: str, dados_ia: dict) -> bool:
