@@ -3,7 +3,7 @@ import json
 import asyncio
 import httpx
 from collections import deque
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 import re
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -354,6 +354,48 @@ async def buscar_lembretes(user_id: str) -> list:
         hoje   = date.today().isoformat()
         filtros = f"user_id=eq.{user_id}&completed=eq.false&date=gte.{hoje}&order=date.asc&limit=10"
         return await sb_get(client, "reminders", filtros)
+
+async def buscar_telefone_por_user_id(client: httpx.AsyncClient, user_id: str) -> str | None:
+    """Resolve user_id → telefone buscando em assinaturas, admin_users e membros_familia."""
+    rows = await sb_get(client, "assinaturas", f"id=eq.{user_id}&select=telefone")
+    if rows and rows[0].get("telefone"):
+        return rows[0]["telefone"]
+
+    rows = await sb_get(client, "admin_users", f"id=eq.{user_id}&select=celular")
+    if rows and rows[0].get("celular"):
+        return rows[0]["celular"]
+
+    rows = await sb_get(client, "membros_familia", f"convidado_id=eq.{user_id}&select=telefone")
+    if rows and rows[0].get("telefone"):
+        return rows[0]["telefone"]
+
+    return None
+
+async def atualizar_lembrete_apos_envio(client: httpx.AsyncClient, reminder_id: str, frequency: str, data_atual: str):
+    """Marca como completed (Único) ou avança a data (recorrente)."""
+    import calendar
+    url = f"{SUPABASE_URL}/rest/v1/reminders?id=eq.{reminder_id}"
+    hdrs = {**sb_headers(), "Prefer": "return=minimal"}
+
+    if frequency == "Único":
+        await client.patch(url, json={"completed": True}, headers=hdrs)
+        return
+
+    from datetime import timedelta
+    d = date.fromisoformat(data_atual)
+    if frequency == "Diário":
+        prox = d + timedelta(days=1)
+    elif frequency == "Semanal":
+        prox = d + timedelta(weeks=1)
+    elif frequency == "Mensal":
+        mes  = d.month % 12 + 1
+        ano  = d.year + (1 if d.month == 12 else 0)
+        dia  = min(d.day, calendar.monthrange(ano, mes)[1])
+        prox = d.replace(year=ano, month=mes, day=dia)
+    else:
+        prox = d + timedelta(days=1)
+
+    await client.patch(url, json={"date": prox.isoformat()}, headers=hdrs)
 
 async def buscar_membros_familia(user_id: str) -> list:
     """Busca membros da família do dono"""
@@ -709,8 +751,12 @@ async def analisar_mensagem_financeira(mensagem_texto: str, telefone: str, confi
     limite_para_lembrar          = LIMITES_PROATIVIDADE.get(proatividade, 4)
     proxima_msg_hora_de_lembrar  = (contador_lembretes[telefone] + 1 >= limite_para_lembrar)
 
+    agora_br = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=3)
+    agora_str = agora_br.strftime("%d/%m/%Y %H:%M")
+
     system_prompt = f"""Você é um assistente financeiro inteligente pelo WhatsApp.
 [SUA PERSONALIDADE]: {PROMPTS_PERSONALIDADE.get(personalidade, PROMPTS_PERSONALIDADE['friendly'])}
+[DATA/HORA ATUAL]: {agora_str} (horário de Brasília)
 
 Sua tarefa é analisar a mensagem do usuário e responder OBRIGATORIAMENTE em JSON.
 
@@ -772,14 +818,24 @@ O JSON deve conter EXATAMENTE estas chaves:
 - 'fixa'             : boolean
 - 'valor'            : number ou null
 - 'categoria'        : string ou null
-- 'data_recorrencia' : string ou null (ex: "todo dia 5", "toda sexta", "20/06/2025 às 10h")
+- 'data_recorrencia' : string ou null
+  REGRAS OBRIGATÓRIAS para tipo 'Lembrete':
+    • Sempre use data E hora ABSOLUTAS no formato "DD/MM/YYYY às HH:MM"
+    • Calcule a partir de [DATA/HORA ATUAL] acima:
+        "daqui 10 minutos"   → some 10 min na hora atual
+        "daqui 2 horas"      → some 2h na hora atual
+        "amanhã às 9h"       → data de amanhã + "às 09:00"
+        "hoje às 15h"        → data de hoje + "às 15:00"
+        "sexta às 19h"       → calcule a data da próxima sexta + "às 19:00"
+        "todo dia às 8h"     → data de amanhã + "às 08:00" (frequência Diário)
+    • NUNCA deixe o horário vago — se o usuário não informar hora, marque pendente=true e pergunte
+  Para finanças fixas: use o formato original ("todo dia 5", "toda semana", etc.)
 - 'descricao'        : string — crie um título limpo e inteligente, NUNCA repita literalmente o que o usuário disse. Ex: "reunião toda terça às 9h" → "Reunião Semanal de Trabalho" | "pago internet 100 todo mês" → "Plano de Internet" | "academia 80 mensalmente" → "Mensalidade Academia" | "recebi salário" → "Salário Mensal"
 - 'pendente'         : boolean — true se faltam informações ESSENCIAIS para registrar. Caso contrário false.
 - 'pergunta'         : string ou null — SE pendente=true, escreva UMA pergunta curta e direta para obter a info que falta. Exemplos:
     • Tipo desconhecido (ex: "500 de lanche"): "Foi uma despesa ou uma receita?"
-    • Lembrete sem hora (ex: "lembrete todo dia"): "Que horas devo te lembrar?"
+    • Lembrete sem hora (ex: "me lembra sexta"): "Que horas devo te lembrar na sexta?"
     • Lembrete sem data (ex: "lembrete às 9h"): "Qual dia ou com qual frequência?"
-    • Lembrete sem nada além da hora: "Qual dia ou frequência desse lembrete?"
     • Finança fixa sem valor: "Qual o valor?"
     Use a personalidade definida na pergunta. Se não falta nada, coloque null.
 - 'resposta_amigavel': string — SEMPRE preencha com a resposta ao usuário. Se pendente=true, use apenas a pergunta do campo 'pergunta' como resposta. Nunca deixe vazio.
@@ -1123,6 +1179,102 @@ async def webhook_excedentes(request: Request, background_tasks: BackgroundTasks
         background_tasks.add_task(gerar_sugestao_excedentes, user_id, tel, config_m)
 
     return {"status": "ok", "dia": hoje.day}
+
+
+async def gerar_msg_lembrete_ia(titulo: str, hora_fmt: str, frequency: str, config: dict) -> str:
+    """Gera uma mensagem de lembrete única e personalizada com a voz do bot do usuário."""
+    personalidade = config.get("personalidade_bot", "friendly")
+    nome          = config.get("_nome", "")
+    cumprimento   = f"para {nome}" if nome else ""
+
+    prompt = (
+        f"Você é um assistente financeiro pelo WhatsApp.\n"
+        f"Personalidade: {PROMPTS_PERSONALIDADE.get(personalidade, PROMPTS_PERSONALIDADE['friendly'])}\n\n"
+        f"Crie uma mensagem CURTA e ÚNICA de lembrete {cumprimento} sobre: \"{titulo}\"\n"
+        + (f"Horário: {hora_fmt}\n" if hora_fmt else "")
+        + (f"Frequência: {frequency}\n" if frequency != "Único" else "")
+        + "\nRegras:\n"
+        "- Máximo 3 linhas\n"
+        "- Comece com 🔔\n"
+        "- Use a personalidade definida (friendly = informal/brother, direct = seco, formal = educado)\n"
+        "- Seja criativo, não repita sempre a mesma frase\n"
+        "- NÃO inclua links nem informações extras\n"
+        "- Apenas a mensagem de lembrete, sem saudações longas"
+    )
+
+    try:
+        response = await client_openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=120,
+            temperature=0.95
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"❌ [LEMBRETE IA] Erro ao gerar mensagem: {e}")
+        return f"🔔 *Lembrete:* {titulo}" + (f"\n⏰ {hora_fmt}" if hora_fmt else "")
+
+
+@app.post("/cron/lembrete-single")
+async def webhook_lembrete_single(request: Request):
+    """
+    Chamado pelo pg_cron do Supabase no horário EXATO do lembrete.
+    O job pg_cron é criado automaticamente via trigger no INSERT da tabela reminders.
+    Protegido por CRON_SECRET no header Authorization.
+    """
+    cron_secret = os.getenv("CRON_SECRET", "")
+    auth_header = request.headers.get("Authorization", "")
+    if cron_secret and auth_header != f"Bearer {cron_secret}":
+        print("🚫 [LEMBRETE] Requisição não autorizada!")
+        return {"status": "unauthorized"}
+
+    body = await request.json()
+    reminder_id = body.get("reminder_id")
+    if not reminder_id:
+        return {"status": "missing_reminder_id"}
+
+    async with httpx.AsyncClient() as client:
+        rows = await sb_get(client, "reminders",
+            f"id=eq.{reminder_id}&select=id,user_id,title,time,frequency,date,completed")
+        if not rows:
+            print(f"⚠️  [LEMBRETE] {reminder_id} não encontrado.")
+            return {"status": "not_found"}
+
+        lembrete  = rows[0]
+        if lembrete.get("completed"):
+            print(f"ℹ️  [LEMBRETE] {reminder_id} já enviado, ignorando.")
+            return {"status": "already_sent"}
+
+        user_id   = lembrete.get("user_id")
+        titulo    = lembrete.get("title", "Lembrete")
+        hora_str  = lembrete.get("time") or ""
+        frequency = lembrete.get("frequency", "Único")
+        data_str  = lembrete.get("date", date.today().isoformat())
+
+        telefone = await buscar_telefone_por_user_id(client, user_id)
+        if not telefone:
+            print(f"⚠️  [LEMBRETE] Telefone não encontrado — user_id={user_id}")
+            return {"status": "phone_not_found"}
+
+        hora_fmt = hora_str[:5] if hora_str else ""
+
+        # Busca config do usuário para personalizar a mensagem
+        config_user = {}
+        try:
+            config_user = await buscar_config_usuario(client, user_id) or {}
+        except Exception:
+            pass
+
+        msg = await gerar_msg_lembrete_ia(titulo, hora_fmt, frequency, config_user)
+        msg += f"\n\n_Gerencie em *{SITE_URL}*_"
+
+        await enviar_mensagem_whatsapp(telefone, msg)
+        # Para Único: marca completed=true (UPDATE trigger cancela o job pg_cron)
+        # Para recorrente: avança a data (UPDATE trigger recria o job pg_cron no novo horário)
+        await atualizar_lembrete_apos_envio(client, reminder_id, frequency, data_str)
+        print(f"✅ [LEMBRETE] '{titulo}' enviado para {telefone} ({frequency})")
+
+    return {"status": "ok"}
 
 
 @app.post("/webhook")
